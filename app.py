@@ -17,6 +17,7 @@ import streamlit as st
 import uuid
 import tempfile
 import os
+import threading
 
 
 # Generate a unique thread ID for each new conversation
@@ -314,6 +315,47 @@ st.set_page_config(
 # Display the main application title
 st.title("Agentic Chatbot with LangGraph")
 
+# ========================= Stop button (fixed above chat input) =========================
+# Only shown while the model is actively streaming.
+# Uses CSS to pin the button just above Streamlit's chat input bar.
+
+if st.session_state.get("is_streaming", False):
+    st.markdown(
+        """
+        <style>
+        div[data-testid="stVerticalBlock"]:has(> div > button#stop-gen-btn) {
+            position: fixed;
+            bottom: 90px;
+            left: 50%;
+            transform: translateX(-50%);
+            z-index: 9999;
+            width: min(760px, 90vw);
+            display: flex;
+            justify-content: flex-end;
+        }
+        button#stop-gen-btn {
+            background: #ff4b4b !important;
+            color: white !important;
+            border: none !important;
+            border-radius: 8px !important;
+            padding: 6px 18px !important;
+            font-size: 0.85rem !important;
+            cursor: pointer;
+        }
+        button#stop-gen-btn:hover {
+            background: #cc0000 !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    stop_col, _ = st.columns([1, 8])
+    with stop_col:
+        if st.button("⏹ Stop", key="stop_gen_btn"):
+            st.session_state["stop_event"].set()
+# =======================================================================================
+
+
 
 # Create message_history when the app runs for the first time
 if "message_history" not in st.session_state:
@@ -335,6 +377,14 @@ if "chat_threads" not in st.session_state:
 # Store the currently pending human approval request
 if "pending_hitl" not in st.session_state:
     st.session_state["pending_hitl"] = None
+
+# Stop-generation event (shared between the streaming generator and the Stop button)
+if "stop_event" not in st.session_state:
+    st.session_state["stop_event"] = threading.Event()
+
+# Tracks whether the model is currently streaming a response
+if "is_streaming" not in st.session_state:
+    st.session_state["is_streaming"] = False
 
 # =============================================================
 
@@ -588,128 +638,96 @@ if user_input:
 
     CONFIG = make_config(st.session_state["thread_id"])
 
+    # Clear any previous stop signal before starting a new stream
+    st.session_state["stop_event"].clear()
+    st.session_state["is_streaming"] = True
+    stop_event: threading.Event = st.session_state["stop_event"]
+
     # Assistant streaming block
     with st.chat_message("assistant"):
 
         # Use a mutable holder so the generator can set/modify it
-        status_holder = {
-            "box": None
-        }
+        status_holder = {"box": None}
 
         def ai_only_stream():
 
             for message_chunk, metadata in chatbot.stream(
-                {
-                    "messages": [
-                        HumanMessage(content=user_input)
-                    ]
-                },
+                {"messages": [HumanMessage(content=user_input)]},
                 config=CONFIG,
                 stream_mode="messages",
             ):
+                # Check stop signal on every chunk
+                if stop_event.is_set():
+                    break
 
-                # Lazily create & update the SAME status container
-                # when any tool runs
-                if isinstance(
-                    message_chunk,
-                    ToolMessage
-                ):
-
-                    tool_name = getattr(
-                        message_chunk,
-                        "name",
-                        "tool"
-                    )
+                if isinstance(message_chunk, ToolMessage):
+                    tool_name = getattr(message_chunk, "name", "tool")
 
                     if status_holder["box"] is None:
-
                         status_holder["box"] = st.status(
                             f"🔧 Using `{tool_name}` …",
                             expanded=True
                         )
-
                     else:
-
                         status_holder["box"].update(
                             label=f"🔧 Using `{tool_name}` …",
                             state="running",
                             expanded=True,
                         )
 
-                # Stream ONLY assistant tokens
-                if isinstance(
-                    message_chunk,
-                    AIMessage
-                ):
+                if isinstance(message_chunk, AIMessage):
                     yield message_chunk.content
 
-            # ========================= HITL ADDED =========================
-
-            # interrupt() pauses the graph without returning
-            # a completed ToolMessage.
-            #
-            # Inspect the saved checkpoint after streaming ends.
+            # Check for HITL interrupt after streaming ends
             pending_interrupt = get_pending_interrupt(
                 st.session_state["thread_id"]
             )
 
             if pending_interrupt is not None:
-
-                # Save the interrupt for displaying approval buttons
                 save_pending_interrupt(
                     st.session_state["thread_id"],
                     pending_interrupt
                 )
-
                 yield (
                     "\n\n⚠️ This stock purchase requires your approval. "
-                    "Use the Approve Purchase or Reject Purchase "
-                    "button below."
+                    "Use the Approve Purchase or Reject Purchase button below."
                 )
 
-            # =============================================================
+        ai_message = st.write_stream(ai_only_stream())
 
-        ai_message = st.write_stream(
-            ai_only_stream()
-        )
+        # Streaming finished — hide the Stop button on next rerun
+        st.session_state["is_streaming"] = False
 
-        # Finalize only if a tool was actually used
+        # Show stopped banner if the user cancelled
+        if stop_event.is_set():
+            st.caption("⏹ Generation stopped.")
+
+        # Finalize tool status box
         if status_holder["box"] is not None:
-
-            # Check whether execution is waiting for approval
-            if get_pending_interrupt(
-                st.session_state["thread_id"]
-            ) is not None:
-
+            if get_pending_interrupt(st.session_state["thread_id"]) is not None:
                 status_holder["box"].update(
                     label="⏸️ Waiting for human approval",
                     state="complete",
                     expanded=False
                 )
-
             else:
-
                 status_holder["box"].update(
                     label="✅ Tool finished",
                     state="complete",
                     expanded=False
                 )
 
-    # Save the complete assistant response in Streamlit session state
-    st.session_state["message_history"].append({
-        "role": "assistant",
-        "content": ai_message
-    })
+    # Save whatever was streamed (partial or full) in session history
+    if ai_message:
+        st.session_state["message_history"].append({
+            "role": "assistant",
+            "content": ai_message
+        })
 
-    # ========================= HITL ADDED =========================
-
-    # Approval controls are rendered earlier in the script.
-    # Rerun so they appear immediately after interrupt().
+    # Rerun so HITL approval controls appear immediately after interrupt()
     if (
         st.session_state.get("pending_hitl") is not None
         and st.session_state["pending_hitl"].get("thread_id")
         == st.session_state["thread_id"]
     ):
         st.rerun()
-
-    # =============================================================
